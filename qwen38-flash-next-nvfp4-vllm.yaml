@@ -1,0 +1,1987 @@
+# Qwen3.8-Flash-Next NVFP4 on 2x DGX Spark (GB10) under vLLM -- Kubernetes manifest
+#
+# Sanitised for publication:
+#   /home/HEAD_USER, /home/WORKER_USER  -> your local users (hostPath mounts)
+#   10.0.0.1 / 10.0.0.2                 -> the two ends of YOUR inter-node RDMA link
+#   example.com                         -> your annotation domain
+#   nvidia-dgx / gx10-ec3d              -> your two node names
+#
+# Read the README first. The single most important line here is `--headless`
+# on the rank != 0 launch; without it the head hangs for 34 minutes with no log.
+# =============================================================================
+# Qwen3.8-Flash-Next NVFP4 en vLLM TP=2 sobre 2x DGX Spark (GB10 / SM121).
+#
+# MIGRACION DESDE SGLANG (01-09-2026). El manifiesto de SGLang se CONSERVA en
+# k8s/qwen38-flash-next-nvfp4-sglang.yaml a proposito: el rollback es un repin
+# al SHA anterior, no un revert de ficheros.
+#
+# Motivo del cambio: el bucle de token 0 ("!!!!!") de sglang#36537. En SGLang
+# se reprodujo de forma fiable con carga agentica; la ruta de vLLM no lo
+# reproduce porque su MambaManager (mamba_cache_mode=align) corrige el estado
+# DESPUES de conocer cuantos tokens especulativos se aceptaron, en vez de
+# cachear los estados SSM intermedios durante el verify.
+#
+# La receta es la de un despliegue hermano ya rodado en 2x DGX Spark, traducida
+# de Sparkrun a k8s. Origen: MANIFEST.md del bundle
+# qwen38-vllm-bf16-mem80-seqs10-20260831, vLLM 0.1.dev20073+g8e685d198,
+# imagen vllm/vllm-openai:qwen38-flash-next.
+#
+# COSTE CONOCIDO, medido por el autor de la receta (llama-benchy, 28/28 celdas):
+#   depth 0   / c1   generacion 36,3 tok/s   TTFR 832 ms
+#   depth 0   / c10  generacion 91,5 tok/s   TTFR 6698 ms
+#   depth 100K/ c2   generacion 45,3 tok/s
+# Nuestro SGLang daba 41-44 tok/s a c1, asi que se pierde ~15% de flujo unico.
+# Se acepta a cambio de no reproducir la corrupcion.
+#
+# KV EN BF16, NO fp8. La QSA de esta imagen RECHAZA fp8_e4m3 como KV principal
+# ("Do not replace `auto` with `fp8_e4m3` without a newer compatible QSA
+# kernel"). Existe parche en vllm#54426 medido en GB10 (pool x1.79, decode
+# plano); se aplicara despues, en cambio separado.
+#
+# PARCHE PLE: la imagen necesita vllm_ple_layer.py encima de su ple_layer.py
+# para cargar los shards PLE en FP8. En Sparkrun es un bind-mount; aqui va como
+# ConfigMap montado sobre el fichero (subPath), que es el equivalente k8s.
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: qwen38-flash-next-vllm-ple
+  namespace: llm
+  labels:
+    llm.dgx-infra/model-family: qwen38-next
+data:
+  ple_layer.py: |
+    # SPDX-License-Identifier: Apache-2.0
+    # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+    """GPU-resident Qwen3.8-Flash-Next position-learning enhancement layers."""
+
+    import os
+    import math
+    from collections.abc import Iterable, Sequence
+
+    import torch
+    import torch.nn.functional as F
+    from torch import nn
+
+    import vllm.envs as envs
+    from vllm.config import CacheConfig, ModelConfig, VllmConfig, get_current_vllm_config
+    from vllm.forward_context import get_forward_context
+    from vllm.model_executor.layers.linear import ReplicatedLinear
+    from vllm.model_executor.layers.mamba.abstract import MambaBase
+    from vllm.model_executor.layers.mamba.mamba_utils import (
+        MambaStateDtypeCalculator,
+        MambaStateShapeCalculator,
+        is_conv_state_dim_first,
+    )
+    from vllm.model_executor.layers.ple_offload_layer import (
+        PleOffloadLayer,
+        is_offload_process,
+    )
+    from vllm.model_executor.layers.quantization.base_config import (
+        QuantizationConfig,
+        QuantizeMethodBase,
+    )
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        create_fp8_scale_parameter,
+        create_fp8_weight_parameter,
+        is_fp8,
+    )
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        is_layer_skipped,
+    )
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        VocabParallelEmbedding,
+    )
+    from vllm.model_executor.models.utils import AutoWeightsLoader
+    from vllm.model_executor.parameter import PerTensorScaleParameter
+    from vllm.transformers_utils.configs.qwen3_8_flash_next import (
+        Qwen3_8FlashNextTextConfig,
+    )
+    from vllm.utils.torch_utils import direct_register_custom_op
+    from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+    from vllm.v1.attention.backends.short_conv_attn import (
+        PleShortConvAttentionBackend,
+        PleShortConvAttentionMetadata,
+    )
+    from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+
+    from ..common.ple import copy_ple_embedding_shard_
+
+    _MASK64 = (1 << 64) - 1
+    _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
+    _SPLITMIX_M1 = 0xBF58476D1CE4E5B9
+    _SPLITMIX_M2 = 0x94D049BB133111EB
+    _PLE_LAYER_PRIME = 10007
+
+
+    def _splitmix64(value: int) -> int:
+        value = (value + _SPLITMIX_GAMMA) & _MASK64
+        value = ((value ^ (value >> 30)) * _SPLITMIX_M1) & _MASK64
+        value = ((value ^ (value >> 27)) * _SPLITMIX_M2) & _MASK64
+        return (value ^ (value >> 31)) & _MASK64
+
+
+    def _is_prime_64(value: int) -> bool:
+        if value < 2:
+            return False
+        for prime in (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37):
+            if value % prime == 0:
+                return value == prime
+        exponent = value - 1
+        shifts = 0
+        while exponent % 2 == 0:
+            exponent //= 2
+            shifts += 1
+        for base in (2, 325, 9375, 28178, 450775, 9780504, 1795265022):
+            if base % value == 0:
+                continue
+            witness = pow(base, exponent, value)
+            if witness in (1, value - 1):
+                continue
+            for _ in range(shifts - 1):
+                witness = pow(witness, 2, value)
+                if witness == value - 1:
+                    break
+            else:
+                return False
+        return True
+
+
+    def _nth_prime_after(start: int, count: int) -> int:
+        prime = int(start)
+        for _ in range(count):
+            candidate = prime + 1
+            if candidate <= 2:
+                prime = 2
+                continue
+            if candidate % 2 == 0:
+                candidate += 1
+            while not _is_prime_64(candidate):
+                candidate += 2
+            prime = candidate
+        return prime
+
+
+    class Qwen3_8FlashNextPLEGroupedNorm(nn.Module):
+        def __init__(
+            self,
+            hidden_size: int,
+            eps: float,
+            group_size: int | None,
+            dtype: torch.dtype | None,
+        ) -> None:
+            super().__init__()
+            if group_size is not None and hidden_size % group_size:
+                raise ValueError(
+                    f"hidden_size ({hidden_size}) must be divisible by "
+                    f"group_size ({group_size})"
+                )
+            self.eps = eps
+            self.group_size = group_size
+            self.weight = nn.Parameter(torch.zeros(hidden_size, dtype=dtype))
+
+        def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+            input_dtype = hidden_states.dtype
+            hidden_states = hidden_states.float()
+            if self.group_size is None:
+                variance = hidden_states.square().mean(dim=-1, keepdim=True)
+                normalized = hidden_states * torch.rsqrt(variance + self.eps)
+            else:
+                grouped = hidden_states.unflatten(
+                    -1, (hidden_states.shape[-1] // self.group_size, self.group_size)
+                )
+                variance = grouped.square().mean(dim=-1, keepdim=True)
+                normalized = (grouped * torch.rsqrt(variance + self.eps)).flatten(-2)
+            return (normalized * (1.0 + self.weight.float())).to(input_dtype)
+
+
+    class Qwen3_8FlashNextPLEFp8EmbeddingMethod(QuantizeMethodBase):
+        """FP8 PLE embedding with one global checkpoint scale."""
+
+        def create_weights(
+            self,
+            layer: nn.Module,
+            input_size_per_partition: int,
+            output_partition_sizes: list[int],
+            input_size: int,
+            output_size: int,
+            params_dtype: torch.dtype,
+            **extra_weight_attrs,
+        ) -> None:
+            del input_size, output_size, params_dtype
+            weight_loader = extra_weight_attrs.get("weight_loader")
+            weight = create_fp8_weight_parameter(
+                sum(output_partition_sizes), input_size_per_partition, weight_loader
+            )
+            layer.register_parameter("weight", weight)
+
+            weight_scale = create_fp8_scale_parameter(
+                PerTensorScaleParameter,
+                output_partition_sizes,
+                input_size_per_partition,
+                None,
+                weight_loader,
+                scale_dtype=torch.bfloat16,
+            )
+            layer.register_parameter("weight_scale", weight_scale)
+
+        def apply(
+            self,
+            layer: nn.Module,
+            x: torch.Tensor,
+            bias: torch.Tensor | None = None,
+        ) -> torch.Tensor:
+            raise NotImplementedError("PLE FP8 weights only support embedding lookup")
+
+        def embedding(self, layer: nn.Module, input_: torch.Tensor) -> torch.Tensor:
+            return F.embedding(input_, layer.weight)
+
+
+    def _get_ple_embedding_quant_method(
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ) -> QuantizeMethodBase | None:
+        """Select global-scale FP8 only for quantized PLE checkpoint shards."""
+
+        if not isinstance(quant_config, Fp8Config):
+            if os.environ.get("VLLM_PLE_FP8_CHECKPOINT", "0").lower() in ("1", "true"):
+                return Qwen3_8FlashNextPLEFp8EmbeddingMethod()
+            return None
+        if not quant_config.is_checkpoint_fp8_serialized:
+            return None
+
+        ignored_layers = quant_config.ignored_layers
+        if is_layer_skipped(
+            prefix,
+            ignored_layers,
+            quant_config.packed_modules_mapping,
+            match_mode=quant_config.ignored_layers_match_mode,
+        ):
+            return None
+        # PLE checkpoint shards form one runtime embedding parameter.
+        shard_prefix = f"{prefix}.shard_"
+        if any(name.startswith(shard_prefix) for name in ignored_layers):
+            return None
+        return Qwen3_8FlashNextPLEFp8EmbeddingMethod()
+
+
+    class Qwen3_8FlashNextNGramEmbedding(PleOffloadLayer):
+        def __init__(
+            self,
+            config: Qwen3_8FlashNextTextConfig,
+            embedding_dim: int,
+            ple_dense_layer_id: int,
+            max_total_tokens: int,
+            max_num_reqs: int,
+            prefix: str,
+            quant_config: QuantizationConfig | None = None,
+            params_dtype: torch.dtype | None = None,
+        ) -> None:
+            super().__init__()
+            self.embedding_dim = embedding_dim
+            self.ngram_size = int(config.ngram_size)
+            self.heads_per_ngram = int(config.heads_per_ngram)
+            self.ngram_heads = (self.ngram_size - 1) * self.heads_per_ngram
+            if self.ngram_size < 2:
+                raise ValueError(f"ngram_size must be >= 2, got {self.ngram_size}")
+            if self.heads_per_ngram <= 0:
+                raise ValueError(f"heads_per_ngram must be > 0, got {self.heads_per_ngram}")
+            if embedding_dim % self.ngram_heads:
+                raise ValueError(
+                    "ple_embed_dim must be divisible by total ngram heads: "
+                    f"{embedding_dim} % {self.ngram_heads} != 0"
+                )
+            self.head_dim = embedding_dim // self.ngram_heads
+            self.eos_token_id = int(config.eos_token_id)
+            self.unigram_vocab_size = int(config.vocab_size)
+            self.split_ngram_parts = int(getattr(config, "split_ngram_parts", 512))
+            if self.split_ngram_parts <= 0:
+                raise ValueError("split_ngram_parts must be positive")
+
+            max_multiplier = ((1 << 63) - 1) // self.unigram_vocab_size
+            half_bound = max(1, max_multiplier // 2)
+            seed = int(getattr(config, "seed", 1234))
+            base_seed = seed + _PLE_LAYER_PRIME * ple_dense_layer_id
+            multipliers = []
+            for index in range(self.ngram_size):
+                value = base_seed + _SPLITMIX_GAMMA * (index + 1)
+                multipliers.append(2 * (_splitmix64(value) % half_bound) + 1)
+            self.register_buffer(
+                "layer_multipliers",
+                torch.tensor(multipliers, dtype=torch.long),
+                persistent=True,
+            )
+
+            ngram_vocab_size_base = int(config.ngram_vocab_size_base)
+            sizes: list[int] = []
+            offsets: list[int] = []
+            offset = 0
+            for local_head in range(self.ngram_heads):
+                global_head = ple_dense_layer_id * self.ngram_heads + local_head
+                size = _nth_prime_after(ngram_vocab_size_base - 1, global_head + 1)
+                sizes.append(size)
+                offsets.append(offset)
+                offset += size
+            self.register_buffer(
+                "ngram_heads_vocab_sizes",
+                torch.tensor(sizes, dtype=torch.long),
+                persistent=True,
+            )
+            self.register_buffer(
+                "ngram_heads_offsets",
+                torch.tensor(offsets, dtype=torch.long),
+                persistent=True,
+            )
+            divisor = int(config.make_ngram_vocab_size_divisible_by)
+            padded_vocab_size = ((offset + divisor - 1) // divisor) * divisor
+            self.ngram_embedding = VocabParallelEmbedding(
+                padded_vocab_size,
+                self.head_dim,
+                params_dtype=params_dtype,
+                padding_size=divisor,
+                prefix=f"{prefix}.ngram_embedding",
+                quant_method=_get_ple_embedding_quant_method(
+                    quant_config, f"{prefix}.ngram_embedding"
+                ),
+            )
+            self.register_buffer(
+                "positions_buffer",
+                torch.arange(max_total_tokens, dtype=torch.int64),
+                persistent=False,
+            )
+            self.register_buffer(
+                "padded_buffer",
+                torch.full(
+                    (max_num_reqs, max_total_tokens),
+                    self.eos_token_id,
+                    dtype=torch.int64,
+                ),
+                persistent=False,
+            )
+
+        @staticmethod
+        def _shift_precompute(
+            tokens: torch.Tensor, eos_token_id: int
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            if tokens.dim() != 2:
+                raise ValueError("tokens must be a 2D tensor")
+            batch_size, seq_len = tokens.shape
+            positions = torch.arange(seq_len, device=tokens.device, dtype=torch.int64)
+            eos_positions = torch.where(tokens == eos_token_id, positions, -1)
+            previous_eos_inclusive = torch.cummax(eos_positions, dim=1).values
+            previous_eos = torch.cat(
+                [
+                    eos_positions.new_full((batch_size, 1), -1),
+                    previous_eos_inclusive[:, :-1],
+                ],
+                dim=1,
+            )
+            return positions, positions.unsqueeze(0) - previous_eos - 1
+
+        @staticmethod
+        def _shift_apply(
+            tokens: torch.Tensor,
+            positions: torch.Tensor,
+            position_in_segment: torch.Tensor,
+            shift: int,
+            eos_token_id: int,
+        ) -> torch.Tensor:
+            if shift == 0:
+                return tokens
+            source = positions - shift
+            gather_indices = source.clamp_min(0).unsqueeze(0).expand(tokens.shape[0], -1)
+            shifted = tokens.gather(1, gather_indices)
+            valid = (source.unsqueeze(0) >= 0) & (position_in_segment >= shift)
+            return torch.where(valid, shifted, tokens.new_full((), eos_token_id))
+
+        def forward_impl(  # type: ignore[override]
+            self,
+            hidden_states: torch.Tensor,
+            input_ids: torch.Tensor,
+            query_start_loc: torch.Tensor,
+            ngram_context: torch.Tensor,
+            output_buffer: torch.Tensor | None = None,
+        ) -> torch.Tensor:
+            del hidden_states
+            input_ids = input_ids.reshape(-1).long()
+            query_start_loc = query_start_loc.long()
+            num_reqs = query_start_loc.numel() - 1
+            num_tokens = input_ids.shape[0]
+            if num_tokens > self.positions_buffer.numel():
+                raise ValueError(
+                    f"PLE received {num_tokens} tokens, but its workspace supports "
+                    f"at most {self.positions_buffer.numel()}"
+                )
+            if num_reqs > self.padded_buffer.shape[0]:
+                raise ValueError(
+                    f"PLE received {num_reqs} requests, but its workspace supports "
+                    f"at most {self.padded_buffer.shape[0]}"
+                )
+
+            # The CPU-offload subprocess is never captured by a CUDA Graph, so its
+            # pack workspace can narrow to the actual maximum sequence length. The
+            # regular GPU path retains the static maximum-width buffer for capture.
+            if is_offload_process():
+                if num_reqs <= 0:
+                    raise ValueError("PLE CPU offload requires at least one request")
+                max_seq_len = max(
+                    1,
+                    int((query_start_loc[1:] - query_start_loc[:-1]).max().item()),
+                )
+                # The model runner sends the CUDA-graph padded token count together
+                # with an unpadded query_start_loc. Stale padding must not enter the
+                # scatter: its clamped indices would overwrite the last real token.
+                num_valid_tokens = min(int(query_start_loc[-1].item()), num_tokens)
+            else:
+                max_seq_len = self.padded_buffer.shape[1]
+                num_valid_tokens = num_tokens
+
+            positions = self.positions_buffer[:num_tokens]
+            packed = self.padded_buffer[:num_reqs, :max_seq_len]
+            packed.fill_(self.eos_token_id)
+            request_indices = torch.searchsorted(query_start_loc, positions, right=True) - 1
+            request_indices.clamp_(max=num_reqs - 1)
+            columns = (positions - query_start_loc[request_indices]).clamp(
+                0, packed.shape[1] - 1
+            )
+            packed[request_indices[:num_valid_tokens], columns[:num_valid_tokens]] = (
+                input_ids[:num_valid_tokens]
+            )
+            ngram_context = ngram_context[:num_reqs].to(
+                device=input_ids.device, dtype=torch.long
+            )
+
+            context = torch.cat([ngram_context, packed], dim=-1)
+            positions_2d, position_in_segment = self._shift_precompute(
+                context, self.eos_token_id
+            )
+            shifted = [context]
+            for shift in range(1, self.ngram_size):
+                shifted.append(
+                    self._shift_apply(
+                        context,
+                        positions_2d,
+                        position_in_segment,
+                        shift,
+                        self.eos_token_id,
+                    )
+                )
+            adjusted_columns = columns + self.ngram_size - 1
+            id_blocks = []
+            for ngram in range(2, self.ngram_size + 1):
+                start = (ngram - 2) * self.heads_per_ngram
+                end = start + self.heads_per_ngram
+                mixed = shifted[0] * self.layer_multipliers[0]
+                for index in range(1, ngram):
+                    mixed = torch.bitwise_xor(
+                        mixed, shifted[index] * self.layer_multipliers[index]
+                    )
+                sizes = self.ngram_heads_vocab_sizes[start:end]
+                offsets = self.ngram_heads_offsets[start:end]
+                ids = torch.remainder(mixed.unsqueeze(-1), sizes) + offsets
+                id_blocks.append(ids[request_indices, adjusted_columns])
+            ngram_ids = torch.cat(id_blocks, dim=-1)
+            if output_buffer is not None:
+                output = output_buffer[:num_tokens, : self.embedding_dim]
+                torch.index_select(
+                    self.ngram_embedding.weight,
+                    0,
+                    ngram_ids.reshape(-1),
+                    out=output.reshape(-1, self.head_dim),
+                )
+                return output
+            return self.ngram_embedding(ngram_ids).flatten(-2)
+
+        def get_offload_output_dtype(self, default_dtype: torch.dtype) -> torch.dtype:
+            """Keep quantized lookup results in their embedding storage dtype."""
+            embedding = getattr(self, "ngram_embedding", None)
+            weight = getattr(embedding, "weight", None)
+            if weight is not None:
+                return weight.dtype
+            if hasattr(self, "_offload_weight_scale"):
+                return torch.float8_e4m3fn
+            return default_dtype
+
+        def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+            """Load hash buffers and checkpoint-split embedding rows."""
+
+            # GPU workers retain only the global FP8 scale. The CPU process owns the
+            # embedding weight and returns its quantized lookup output unchanged.
+            if envs.VLLM_PLE_CPU_OFFLOAD and not is_offload_process():
+                retained: set[str] = set()
+                for name, loaded_weight in weights:
+                    if name != "ngram_embedding.weight_scale":
+                        continue
+                    self.register_buffer(
+                        "_offload_weight_scale",
+                        loaded_weight.to(device=torch.accelerator.current_accelerator()),
+                        persistent=False,
+                    )
+                    retained.add(name)
+                return retained
+
+            persistent_buffers = {
+                "layer_multipliers": self.layer_multipliers,
+                "ngram_heads_offsets": self.ngram_heads_offsets,
+                "ngram_heads_vocab_sizes": self.ngram_heads_vocab_sizes,
+            }
+            loaded: set[str] = set()
+            regular_weights: list[tuple[str, torch.Tensor]] = []
+            shard_prefix = "ngram_embedding.shard_"
+
+            for name, loaded_weight in weights:
+                leaf_name = name.rsplit(".", 1)[-1]
+                if leaf_name.startswith("hashstats_") or leaf_name == "token_lookup":
+                    continue
+                if name in persistent_buffers:
+                    buffer = persistent_buffers[name]
+                    if buffer.shape != loaded_weight.shape:
+                        raise ValueError(
+                            f"Shape mismatch for {name}: expected "
+                            f"{tuple(buffer.shape)}, got {tuple(loaded_weight.shape)}"
+                        )
+                    buffer.copy_(loaded_weight.to(device=buffer.device, dtype=buffer.dtype))
+                    loaded.add(name)
+                    continue
+                if name.startswith(shard_prefix) and name.endswith(".weight"):
+                    shard_text = name[len(shard_prefix) : -len(".weight")]
+                    if not shard_text.isdigit():
+                        regular_weights.append((name, loaded_weight))
+                        continue
+                    shard_index = int(shard_text)
+                    if shard_index >= self.split_ngram_parts:
+                        raise ValueError(
+                            f"PLE embedding shard index {shard_index} exceeds "
+                            f"split_ngram_parts={self.split_ngram_parts}"
+                        )
+                    embedding = self.ngram_embedding
+                    shard_size = (
+                        embedding.org_vocab_size + self.split_ngram_parts - 1
+                    ) // self.split_ngram_parts
+                    checkpoint_start = shard_index * shard_size
+                    expected_rows = max(
+                        0,
+                        min(shard_size, embedding.org_vocab_size - checkpoint_start),
+                    )
+                    expected_shape = (expected_rows, embedding.embedding_dim)
+                    if tuple(loaded_weight.shape) != expected_shape:
+                        raise ValueError(
+                            f"Shape mismatch for PLE embedding shard {shard_index}: "
+                            f"expected {expected_shape}, got "
+                            f"{tuple(loaded_weight.shape)}"
+                        )
+                    copy_ple_embedding_shard_(
+                        embedding.weight.data,
+                        loaded_weight,
+                        checkpoint_start=checkpoint_start,
+                        tp_start=embedding.shard_indices.org_vocab_start_index,
+                        tp_end=embedding.shard_indices.org_vocab_end_index,
+                    )
+                    loaded.add("ngram_embedding.weight")
+                    continue
+                regular_weights.append((name, loaded_weight))
+
+            if regular_weights:
+                loaded.update(AutoWeightsLoader(self).load_weights(regular_weights))
+            return loaded
+
+
+    class Qwen3_8FlashNextPLELayer(nn.Module, MambaBase):
+        def __init__(
+            self,
+            config: Qwen3_8FlashNextTextConfig,
+            vllm_config: VllmConfig,
+            layer_idx: int = 0,
+            ple_dense_layer_id: int | None = None,
+            prefix: str = "",
+        ) -> None:
+            super().__init__()
+            model_config = vllm_config.model_config
+            cache_config = vllm_config.cache_config
+            quant_config = vllm_config.quant_config
+            self.model_config: ModelConfig = model_config
+            self.cache_config: CacheConfig = cache_config
+            self.layer_idx = layer_idx
+            self.ple_dense_layer_id = (
+                int(ple_dense_layer_id)
+                if ple_dense_layer_id is not None
+                else int(layer_idx)
+            )
+            self.prefix = prefix
+            self.hidden_size = int(config.hidden_size)
+            self.hc_count = config.hc_count
+            self.hc_hidden_size = self.hidden_size * self.hc_count
+            self.conv_kernel_size = int(config.ple_conv_kernel_size)
+            self.short_conv_dilation = int(config.ngram_size)
+            self.conv_state_len = (self.conv_kernel_size - 1) * self.short_conv_dilation
+            self.num_spec_tokens = vllm_config.num_speculative_tokens
+            self.activation = "silu"
+            # The offload process builds the surrounding model on meta while
+            # this subtree must own real CPU storage. GPU workers skip the
+            # subclass constructor and retain only an empty IPC placeholder.
+            with torch.device(PleOffloadLayer.get_target_device()):
+                self.ple_embedding: nn.Module = Qwen3_8FlashNextNGramEmbedding(
+                    config,
+                    int(config.ple_embed_dim),
+                    self.ple_dense_layer_id,
+                    vllm_config.scheduler_config.max_num_batched_tokens,
+                    vllm_config.scheduler_config.max_num_seqs,
+                    f"{prefix}.ple_embedding",
+                    quant_config=quant_config,
+                    params_dtype=model_config.dtype,
+                )
+            self.key_proj = ReplicatedLinear(
+                int(config.ple_embed_dim),
+                self.hc_hidden_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.key_proj",
+            )
+            self.value_proj = ReplicatedLinear(
+                int(config.ple_embed_dim),
+                self.hidden_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.value_proj",
+            )
+            norm_args = (
+                self.hc_hidden_size,
+                config.rms_norm_eps,
+                self.hidden_size,
+                model_config.dtype,
+            )
+            self.norm_key = Qwen3_8FlashNextPLEGroupedNorm(*norm_args)
+            self.norm_query = Qwen3_8FlashNextPLEGroupedNorm(*norm_args)
+            self.norm_conv = Qwen3_8FlashNextPLEGroupedNorm(*norm_args)
+            self.conv1d = nn.Conv1d(
+                self.hc_hidden_size,
+                self.hc_hidden_size,
+                self.conv_kernel_size,
+                groups=self.hc_hidden_size,
+                padding=self.conv_state_len,
+                dilation=self.short_conv_dilation,
+                bias=False,
+                dtype=model_config.dtype,
+            )
+            nn.init.zeros_(self.conv1d.weight)
+            self.conv1d.weight._no_reinit = True
+            self.kv_cache = (torch.tensor([]),)
+            compilation_config = get_current_vllm_config().compilation_config
+            if prefix in compilation_config.static_forward_context:
+                raise ValueError(f"Duplicate layer name: {prefix}")
+            compilation_config.static_forward_context[prefix] = self
+
+        def _get_embedding_weight_scale(self) -> torch.Tensor | None:
+            embedding = getattr(self.ple_embedding, "ngram_embedding", None)
+            weight_scale = getattr(embedding, "weight_scale", None)
+            if weight_scale is not None:
+                return weight_scale
+            return getattr(self.ple_embedding, "_offload_weight_scale", None)
+
+        def _dequantize_embeddings(
+            self,
+            embeddings: torch.Tensor,
+            output_dtype: torch.dtype,
+        ) -> torch.Tensor:
+            """Dequantize PLE lookup output."""
+
+            if not is_fp8(embeddings):
+                return embeddings
+            weight_scale = self._get_embedding_weight_scale()
+            if weight_scale is None:
+                raise RuntimeError("FP8 PLE embedding is missing its global scale")
+            if weight_scale.device != embeddings.device:
+                raise RuntimeError("FP8 PLE embedding scale must be on the output device")
+            return embeddings.to(output_dtype) * weight_scale.to(output_dtype)
+
+        @property
+        def mamba_type(self) -> MambaAttentionBackendEnum:
+            return MambaAttentionBackendEnum.SHORT_CONV
+
+        @property
+        def is_kv_cache_tp_replicated(self) -> bool:
+            return True
+
+        def get_attn_backend(self) -> type[PleShortConvAttentionBackend]:
+            return PleShortConvAttentionBackend
+
+        def get_state_dtype(self) -> tuple[torch.dtype, ...]:
+            return MambaStateDtypeCalculator.short_conv_state_dtype(
+                self.model_config.dtype, self.cache_config.mamba_cache_dtype
+            )
+
+        def get_state_shape(self) -> Sequence[tuple[int, ...]]:
+            return MambaStateShapeCalculator.short_conv_state_shape(
+                tp_world_size=1,
+                intermediate_size=self.hc_hidden_size,
+                conv_kernel=self.conv_state_len + 1,
+                num_spec=self.num_spec_tokens,
+            )
+
+        def _apply_norm(
+            self, norm: Qwen3_8FlashNextPLEGroupedNorm, hidden_states: torch.Tensor
+        ) -> torch.Tensor:
+            shape = hidden_states.shape
+            return norm(hidden_states.flatten(-2)).reshape(shape)
+
+        def _short_conv_fallback(self, inputs: torch.Tensor) -> torch.Tensor:
+            # Profiling / CUDA graph capture only; conv state is not updated.
+            inputs_t = inputs.transpose(0, 1).unsqueeze(0)
+            output = self.conv1d(inputs_t)[..., : inputs_t.size(-1)]
+            return F.silu(output).squeeze(0).transpose(0, 1)
+
+        def _short_conv_dilated_decode_batched(
+            self,
+            x_d: torch.Tensor,
+            conv_state: torch.Tensor,
+            conv_weights: torch.Tensor,
+            state_indices_tensor_d: torch.Tensor,
+            has_initial_states_d: torch.Tensor | None,
+        ) -> torch.Tensor:
+            state_indices = state_indices_tensor_d.to(
+                device=conv_state.device, dtype=torch.int64
+            )
+            # TODO: need double-check
+            # FULL cudagraph padded decode rows use NULL_BLOCK_ID. Remap them to
+            # slot 0 for a safe gather, then zero output and skip write-back.
+            valid_state = state_indices != NULL_BLOCK_ID
+            state_indices = torch.where(
+                valid_state, state_indices, torch.zeros_like(state_indices)
+            )
+            if has_initial_states_d is None:
+                has_initial_state = valid_state
+            else:
+                if has_initial_states_d.numel() < state_indices_tensor_d.numel():
+                    raise ValueError(
+                        "has_initial_states_d size mismatch: "
+                        f"got {has_initial_states_d.numel()}, "
+                        f"need >= {state_indices_tensor_d.numel()}."
+                    )
+                has_initial_state = has_initial_states_d[
+                    : state_indices_tensor_d.numel()
+                ].to(device=conv_state.device, dtype=torch.bool)
+                has_initial_state = has_initial_state & valid_state
+
+            cached_state = conv_state.index_select(0, state_indices)
+            state = cached_state[..., : self.conv_state_len].to(x_d.dtype)
+            if self.conv_state_len > 0:
+                initial_state = torch.where(
+                    has_initial_state.view(-1, 1, 1),
+                    state,
+                    torch.zeros_like(state),
+                )
+                history = torch.cat((initial_state, x_d.unsqueeze(-1)), dim=-1)
+            else:
+                history = x_d.unsqueeze(-1)
+
+            conv_output = F.conv1d(
+                history,
+                conv_weights.unsqueeze(1).contiguous(),
+                groups=history.size(1),
+                dilation=self.short_conv_dilation,
+            ).squeeze(-1)
+            output = F.silu(conv_output)
+            output = output * valid_state.view(-1, 1).to(output.dtype)
+
+            if self.conv_state_len > 0:
+                next_state = history[..., -self.conv_state_len :]
+                # Padded rows are remapped to the reserved null slot. Preserve its
+                # existing value while writing the new states for valid rows.
+                existing_base_state = cached_state[..., : self.conv_state_len]
+                safe_next_state = torch.where(
+                    valid_state.view(-1, 1, 1),
+                    next_state.to(conv_state.dtype),
+                    existing_base_state,
+                )
+                cached_state[..., : self.conv_state_len] = safe_next_state
+                conv_state.index_copy_(0, state_indices, cached_state)
+
+            return output
+
+        def _short_conv_dilated_prefill_batched(
+            self,
+            x_p: torch.Tensor,
+            metadata: PleShortConvAttentionMetadata,
+            conv_state: torch.Tensor,
+            conv_weights: torch.Tensor,
+            state_indices_tensor_p: torch.Tensor,
+            num_prefills: int,
+            num_decode_tokens: int,
+            num_prefill_tokens: int,
+        ) -> torch.Tensor:
+            # ``non_spec_query_start_loc`` covers the non-spec (decode + prefill)
+            # requests and equals ``query_start_loc`` when spec-decode is inactive.
+            non_spec_query_start_loc = metadata.non_spec_query_start_loc
+            if non_spec_query_start_loc is None:
+                raise ValueError("query_start_loc is required for prefill short-conv")
+            query_start_loc_p = (
+                non_spec_query_start_loc[-num_prefills - 1 :] - num_decode_tokens
+            )
+            # The metadata builder guarantees that the prefill query offsets start
+            # at 0 and end at num_prefill_tokens. Avoid reading those values here,
+            # since doing so would force a device-to-host synchronization.
+            has_initial_states_p = metadata.has_initial_states_p
+            if has_initial_states_p is None:
+                raise ValueError("has_initial_states_p is required for prefill short-conv")
+
+            output = torch.empty_like(x_p)
+            q_starts = query_start_loc_p.to(torch.int64)
+            if state_indices_tensor_p.numel() < num_prefills:
+                raise ValueError(
+                    "state_indices_tensor_p size mismatch: "
+                    f"got {state_indices_tensor_p.numel()}, "
+                    f"need >= {num_prefills}."
+                )
+            if has_initial_states_p.numel() < num_prefills:
+                raise ValueError(
+                    "has_initial_states_p size mismatch: "
+                    f"got {has_initial_states_p.numel()}, "
+                    f"need >= {num_prefills}."
+                )
+            if num_prefills == 0 or x_p.numel() == 0:
+                return output
+            lengths = q_starts[1:] - q_starts[:-1]
+            # Use the CPU-computed packing width from the metadata builder instead
+            # of synchronizing on lengths.max().
+            max_len = metadata.max_prefill_query_len
+            if max_len <= 0:
+                return output
+
+            hidden_size = x_p.shape[1]
+            positions = torch.arange(
+                num_prefill_tokens, device=x_p.device, dtype=torch.int64
+            )
+            req_indices = torch.searchsorted(q_starts[1:], positions, right=True)
+            col_indices = positions - q_starts[req_indices]
+
+            packed_tokens = x_p.new_zeros((num_prefills, max_len, hidden_size))
+            packed_tokens[req_indices, col_indices] = x_p
+            packed_tokens = packed_tokens.transpose(1, 2).contiguous()
+
+            state_indices = state_indices_tensor_p[:num_prefills].to(
+                device=conv_state.device, dtype=torch.int64
+            )
+            valid_state = state_indices != NULL_BLOCK_ID
+            state_indices = torch.where(
+                valid_state, state_indices, torch.zeros_like(state_indices)
+            )
+            has_initial = has_initial_states_p[:num_prefills].to(
+                device=conv_state.device, dtype=torch.bool
+            )
+            if self.conv_state_len > 0:
+                if conv_state.shape[0] == 0:
+                    state = conv_state.new_zeros(
+                        (num_prefills, hidden_size, self.conv_state_len),
+                        dtype=x_p.dtype,
+                    )
+                else:
+                    state = conv_state.index_select(0, state_indices)[
+                        ..., : self.conv_state_len
+                    ].to(x_p.dtype)
+                use_initial_mask = (valid_state & has_initial).view(num_prefills, 1, 1)
+                initial_state = torch.where(
+                    use_initial_mask,
+                    state,
+                    torch.zeros_like(state),
+                )
+                history = torch.cat((initial_state, packed_tokens), dim=-1)
+            else:
+                history = packed_tokens
+
+            conv_output = F.conv1d(
+                history,
+                conv_weights.unsqueeze(1).contiguous(),
+                groups=history.size(1),
+                dilation=self.short_conv_dilation,
+            )
+            conv_output = F.silu(conv_output).transpose(1, 2).contiguous()
+
+            token_positions = torch.arange(max_len, device=x_p.device, dtype=torch.int64)
+            valid_tokens = token_positions.view(1, max_len) < lengths.view(num_prefills, 1)
+            valid_output_mask = valid_tokens & valid_state.to(device=x_p.device).view(
+                num_prefills, 1
+            )
+            conv_output.masked_fill_(~valid_output_mask.unsqueeze(-1), 0)
+            output.copy_(conv_output[req_indices, col_indices])
+
+            if self.conv_state_len > 0 and conv_state.shape[0] > 0:
+                state_starts = lengths.to(device=history.device, dtype=torch.int64).view(
+                    num_prefills, 1, 1
+                )
+                state_offsets = torch.arange(
+                    self.conv_state_len, device=history.device, dtype=torch.int64
+                ).view(1, 1, self.conv_state_len)
+                next_state = history.gather(
+                    dim=2,
+                    index=(state_starts + state_offsets).expand(-1, history.size(1), -1),
+                )
+                # Write back without a host synchronization. Valid, non-empty rows
+                # receive their new state; padding and zero-length rows keep the
+                # current cache value.
+                existing_state = conv_state.index_select(0, state_indices)
+                existing_base_state = existing_state[..., : self.conv_state_len]
+                update_mask = valid_state & (lengths.to(device=conv_state.device) > 0)
+                safe_next_state = torch.where(
+                    update_mask.view(num_prefills, 1, 1),
+                    next_state.to(conv_state.dtype),
+                    existing_base_state,
+                )
+                existing_state[..., : self.conv_state_len] = safe_next_state
+                conv_state.index_copy_(0, state_indices, existing_state)
+            return output
+
+        def _short_conv_dilated_spec_batched(
+            self,
+            x_spec: torch.Tensor,
+            conv_state: torch.Tensor,
+            conv_weights: torch.Tensor,
+            spec_state_indices_tensor: torch.Tensor,
+            spec_query_start_loc: torch.Tensor,
+            num_accepted_tokens: torch.Tensor,
+            spec_query_len: int,
+        ) -> torch.Tensor:
+            """Dilated short-conv for speculative-decode (MTP) requests.
+
+            Each spec request feeds multiple (draft + 1) query tokens. The conv
+            outputs are computed causally after rolling back the previous draft
+            state by ``num_accepted_tokens - 1``. The current candidate inputs stay
+            in the extended cache for the next forward, matching
+            ``causal_conv1d_update``.
+
+            ``spec_query_len`` (== num_speculative_tokens + 1) is the maximum query
+            length and is a Python int, so no host synchronization is needed; this
+            keeps the path safe for full CUDA-graph capture/replay where the buffers
+            are padded at the request level.
+            """
+            num_reqs = spec_state_indices_tensor.numel()
+            hidden_size = x_spec.size(-1)
+            # Use a fixed packing width instead of synchronizing on lengths.max().
+            max_len = spec_query_len
+            # Full CUDA graphs can pad these buffers. Only the first num_reqs
+            # accepted-token counts belong to actual speculative requests.
+            num_accepted_tokens = num_accepted_tokens[:num_reqs]
+            q_starts = spec_query_start_loc[: num_reqs + 1].to(torch.int64)
+            # Keep the number of real speculative tokens on the device.
+            total_real_tokens = q_starts[num_reqs]
+
+            state_indices = spec_state_indices_tensor.to(
+                device=conv_state.device, dtype=torch.int64
+            )
+            valid_state = state_indices != NULL_BLOCK_ID
+            state_indices = torch.where(
+                valid_state, state_indices, torch.zeros_like(state_indices)
+            )
+            positions = torch.arange(
+                x_spec.size(0), device=x_spec.device, dtype=torch.int64
+            )
+            # Route graph-padded token rows to the discarded dummy request so that
+            # they cannot overwrite real packed data.
+            req_indices = torch.searchsorted(q_starts[1:], positions, right=True)
+            valid_tokens = (positions < total_real_tokens) & (req_indices < num_reqs)
+            clamped_req_indices = req_indices.clamp_max(max(num_reqs - 1, 0))
+            col_indices = (positions - q_starts[clamped_req_indices]).clamp_(0, max_len - 1)
+            pack_req_indices = torch.where(
+                valid_tokens,
+                clamped_req_indices,
+                torch.full_like(req_indices, num_reqs),
+            )
+            pack_col_indices = torch.where(
+                valid_tokens, col_indices, torch.zeros_like(col_indices)
+            )
+
+            # The last request row is the dummy sink for graph padding.
+            packed = x_spec.new_zeros((num_reqs + 1, max_len, hidden_size))
+            packed[pack_req_indices, pack_col_indices] = x_spec
+            packed = packed.transpose(1, 2).contiguous()
+
+            if self.conv_state_len > 0:
+                cached_state = conv_state.index_select(0, state_indices)
+                rollback_offsets = num_accepted_tokens.to(
+                    device=conv_state.device, dtype=torch.int64
+                ).sub(1)
+                rollback_offsets = torch.where(
+                    valid_state,
+                    rollback_offsets.clamp_(0, max_len - 1),
+                    torch.zeros_like(rollback_offsets),
+                )
+                state_offsets = torch.arange(
+                    self.conv_state_len, device=conv_state.device, dtype=torch.int64
+                ).view(1, 1, self.conv_state_len)
+                rollback_indices = rollback_offsets.view(-1, 1, 1) + state_offsets
+                state = cached_state.gather(
+                    2, rollback_indices.expand(-1, hidden_size, -1)
+                ).to(x_spec.dtype)
+                state = torch.where(
+                    valid_state.view(num_reqs, 1, 1),
+                    state,
+                    torch.zeros_like(state),
+                )
+                # Append a zeroed dummy-row state to match the [num_reqs + 1] pack.
+                dummy_state = state.new_zeros((1, hidden_size, self.conv_state_len))
+                state_full = torch.cat((state, dummy_state), dim=0)
+                history = torch.cat((state_full, packed), dim=-1)
+            else:
+                history = packed
+
+            conv_output = F.conv1d(
+                history,
+                conv_weights.unsqueeze(1).contiguous(),
+                groups=history.size(1),
+                dilation=self.short_conv_dilation,
+            )
+            conv_output = F.silu(conv_output).transpose(1, 2).contiguous()
+
+            output = conv_output[pack_req_indices, pack_col_indices]
+            output = output * valid_tokens.view(-1, 1).to(output.dtype)
+
+            # Keep all current candidate inputs in the extended state. On the next
+            # target forward, ``num_accepted_tokens - 1`` selects the rollback
+            # window before processing the newly scheduled tokens.
+            if self.conv_state_len > 0:
+                state_capacity = self.conv_state_len + max_len - 1
+                if conv_state.size(-1) < state_capacity:
+                    raise RuntimeError(
+                        "PLE short-conv cache cannot retain speculative tokens: "
+                        f"got {conv_state.size(-1)}, need {state_capacity}."
+                    )
+                candidate_state = history[:num_reqs, :, 1 : state_capacity + 1]
+                query_lengths = q_starts[1:] - q_starts[:-1]
+                state_positions = torch.arange(
+                    state_capacity, device=history.device, dtype=torch.int64
+                ).view(1, 1, state_capacity)
+                update_lengths = (self.conv_state_len + query_lengths - 1).view(
+                    num_reqs, 1, 1
+                )
+                update_mask = valid_state.view(num_reqs, 1, 1) & (
+                    state_positions < update_lengths
+                )
+                existing_state = cached_state[..., :state_capacity]
+                next_state = torch.where(
+                    update_mask,
+                    candidate_state.to(conv_state.dtype),
+                    existing_state,
+                )
+                cached_state[..., :state_capacity] = next_state
+                conv_state.index_copy_(0, state_indices, cached_state)
+
+            return output
+
+        def _short_conv_dilated_dispatch(
+            self,
+            inputs: torch.Tensor,
+            metadata: PleShortConvAttentionMetadata,
+            conv_state: torch.Tensor,
+            conv_weights: torch.Tensor,
+        ) -> torch.Tensor:
+            num_prefills = metadata.num_prefills
+            num_decodes = metadata.num_decodes
+            num_decode_tokens = metadata.num_decode_tokens
+            num_prefill_tokens = metadata.num_prefill_tokens
+            has_prefill = num_prefills > 0
+            has_decode = num_decodes > 0
+            has_spec = metadata.spec_sequence_masks is not None
+            x = inputs[: metadata.num_actual_tokens]
+
+            # Split spec / non-spec tokens.
+            if has_spec:
+                if has_prefill or has_decode:
+                    assert metadata.spec_token_indx is not None
+                    assert metadata.non_spec_token_indx is not None
+                    x_spec = x.index_select(0, metadata.spec_token_indx.long())
+                    x_non_spec = x.index_select(0, metadata.non_spec_token_indx.long())
+                else:
+                    x_spec = x
+                    x_non_spec = None
+            else:
+                x_spec = None
+                x_non_spec = x
+
+            spec_output = None
+            # 1. Run the multi-query speculative-decode part.
+            if has_spec:
+                assert metadata.spec_state_indices_tensor is not None
+                assert metadata.spec_query_start_loc is not None
+                assert metadata.num_accepted_tokens is not None
+                spec_output = self._short_conv_dilated_spec_batched(
+                    x_spec=x_spec,
+                    conv_state=conv_state,
+                    conv_weights=conv_weights,
+                    spec_state_indices_tensor=metadata.spec_state_indices_tensor[
+                        : metadata.num_spec_decodes
+                    ],
+                    spec_query_start_loc=metadata.spec_query_start_loc,
+                    num_accepted_tokens=metadata.num_accepted_tokens,
+                    spec_query_len=metadata.spec_query_len,
+                )
+
+            # 2. Run regular decode and prefill requests.
+            conv_out_non_spec = None
+            state_indices_tensor = metadata.state_indices_tensor
+            if x_non_spec is not None:
+                assert state_indices_tensor is not None
+                if has_prefill:
+                    state_indices_tensor_d, state_indices_tensor_p = torch.split(
+                        state_indices_tensor,
+                        [num_decodes, num_prefills],
+                        dim=0,
+                    )
+                    x_d, x_p = torch.split(
+                        x_non_spec,
+                        [num_decode_tokens, num_prefill_tokens],
+                        dim=0,
+                    )
+                    non_spec_parts: list[torch.Tensor] = []
+                    if has_decode:
+                        non_spec_parts.append(
+                            self._short_conv_dilated_decode_batched(
+                                x_d=x_d,
+                                conv_state=conv_state,
+                                conv_weights=conv_weights,
+                                state_indices_tensor_d=state_indices_tensor_d,
+                                has_initial_states_d=metadata.has_initial_states_d,
+                            )
+                        )
+                    non_spec_parts.append(
+                        self._short_conv_dilated_prefill_batched(
+                            x_p=x_p,
+                            metadata=metadata,
+                            conv_state=conv_state,
+                            conv_weights=conv_weights,
+                            state_indices_tensor_p=state_indices_tensor_p,
+                            num_prefills=num_prefills,
+                            num_decode_tokens=num_decode_tokens,
+                            num_prefill_tokens=num_prefill_tokens,
+                        )
+                    )
+                    conv_out_non_spec = torch.vstack(non_spec_parts)
+                else:
+                    conv_out_non_spec = self._short_conv_dilated_decode_batched(
+                        x_d=x_non_spec,
+                        conv_state=conv_state,
+                        conv_weights=conv_weights,
+                        state_indices_tensor_d=state_indices_tensor[: x_non_spec.size(0)],
+                        has_initial_states_d=metadata.has_initial_states_d,
+                    )
+
+            # 3. Merge both parts back into the original token order.
+            if has_spec and conv_out_non_spec is not None:
+                assert metadata.spec_token_indx is not None
+                assert metadata.non_spec_token_indx is not None
+                assert spec_output is not None
+                output = x.new_empty((metadata.num_actual_tokens, x.size(-1)))
+                output.index_copy_(0, metadata.spec_token_indx, spec_output)
+                output.index_copy_(0, metadata.non_spec_token_indx, conv_out_non_spec)
+                return output
+            elif has_spec:
+                assert spec_output is not None
+                return spec_output
+            if conv_out_non_spec is None:
+                return x
+            return conv_out_non_spec
+
+        def _short_conv(self, inputs: torch.Tensor) -> torch.Tensor:
+            forward_context = get_forward_context()
+            attn_metadata = forward_context.attn_metadata
+            if attn_metadata is None:
+                return self._short_conv_fallback(inputs)
+
+            if not isinstance(attn_metadata, dict):
+                raise RuntimeError(
+                    "PLE short-conv expects per-layer attention metadata dict "
+                    f"during inference, got {type(attn_metadata).__name__}."
+                )
+
+            layer_attn_metadata = attn_metadata.get(self.prefix)
+            if layer_attn_metadata is None:
+                raise RuntimeError(
+                    f"Missing short-conv metadata for layer '{self.prefix}'. "
+                    "This would bypass conv-state updates and is not allowed."
+                )
+            if not isinstance(layer_attn_metadata, PleShortConvAttentionMetadata):
+                raise TypeError(
+                    "Expected PleShortConvAttentionMetadata for layer "
+                    f"'{self.prefix}', got "
+                    f"{type(layer_attn_metadata).__name__}."
+                )
+
+            conv_state = self.kv_cache[0]
+            if not is_conv_state_dim_first():
+                conv_state = conv_state.transpose(-1, -2)
+            conv_weights = self.conv1d.weight.squeeze(1)
+
+            state_capacity = self.conv_state_len + self.num_spec_tokens
+            if state_capacity > 0:
+                if conv_state.size(-1) < state_capacity:
+                    raise RuntimeError(
+                        "PLE short-conv cache is smaller than expected for "
+                        f"dilated convolution: got {conv_state.size(-1)}, "
+                        f"expect at least {state_capacity}."
+                    )
+                conv_state = conv_state[..., -state_capacity:]
+            return self._short_conv_dilated_dispatch(
+                inputs,
+                layer_attn_metadata,
+                conv_state,
+                conv_weights.to(dtype=inputs.dtype),
+            )
+
+        def forward(
+            self,
+            hidden_states: torch.Tensor,
+            input_ids: torch.Tensor,
+            query_start_loc: torch.Tensor,
+            ngram_context: torch.Tensor,
+        ) -> torch.Tensor:
+            input_ids = input_ids.reshape(-1)
+            if input_ids.shape[0] != hidden_states.shape[0]:
+                raise ValueError(
+                    "PLE expects input_ids and hidden_states to have the same "
+                    f"token length, got {input_ids.shape[0]} and "
+                    f"{hidden_states.shape[0]}"
+                )
+            embeddings = self.ple_embedding(
+                hidden_states,
+                input_ids,
+                query_start_loc,
+                ngram_context,
+            )
+            embeddings = self._dequantize_embeddings(embeddings, hidden_states.dtype)
+            key, _ = self.key_proj(embeddings)
+            value, _ = self.value_proj(embeddings)
+            token_count = hidden_states.shape[0]
+            key = key.reshape(token_count, self.hc_count, self.hidden_size)
+            query = hidden_states.reshape(token_count, self.hc_count, self.hidden_size)
+            key = self._apply_norm(self.norm_key, key)
+            query = self._apply_norm(self.norm_query, query)
+            gate = (key * query).sum(dim=-1, keepdim=True) / math.sqrt(self.hidden_size)
+            gate = torch.sigmoid(gate.sign() * gate.abs().clamp_min(1e-6).sqrt())
+            gated_value = gate * value.unsqueeze(-2)
+            normalized = self._apply_norm(self.norm_conv, gated_value).flatten(-2)
+            conv_output = torch.zeros_like(normalized)
+            torch.ops.vllm.qwen3_8_flash_next_ple_short_conv(
+                normalized,
+                conv_output,
+                self.prefix,
+            )
+            return gated_value.flatten(-2) + conv_output
+
+
+    def qwen3_8_flash_next_ple_short_conv(
+        inputs: torch.Tensor,
+        output: torch.Tensor,
+        layer_name: str,
+    ) -> None:
+        layer = get_forward_context().no_compile_layers[layer_name]
+        result = layer._short_conv(inputs)
+        output[: result.shape[0]].copy_(result)
+
+
+    def qwen3_8_flash_next_ple_short_conv_fake(
+        inputs: torch.Tensor,
+        output: torch.Tensor,
+        layer_name: str,
+    ) -> None:
+        return
+
+
+    direct_register_custom_op(
+        op_name="qwen3_8_flash_next_ple_short_conv",
+        op_func=qwen3_8_flash_next_ple_short_conv,
+        mutates_args=["output"],
+        fake_impl=qwen3_8_flash_next_ple_short_conv_fake,
+    )
+
+
+    __all__ = [
+        "Qwen3_8FlashNextNGramEmbedding",
+        "Qwen3_8FlashNextPLEGroupedNorm",
+        "Qwen3_8FlashNextPLELayer",
+    ]
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: qwen38-flash-next-vllm-launch
+  namespace: llm
+  labels:
+    llm.dgx-infra/model-family: qwen38-next
+data:
+  launch.sh: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    # El enlace RoCE tiene DOS puertos. La receta de origen usa el f1
+    # (enp1s0f1np1 / rocep1s0f1); nuestro rdma-link-200g.service fija el f0.
+    # Se mantiene f0 porque es el que esta cableado y verificado a 200 Gb/s en
+    # este par de maquinas; cambiarlo seria otro experimento.
+    IFACE="${RDMA_IFACE:-enp1s0f0np0}"
+    HCA="${RDMA_HCA:-rocep1s0f0}"
+
+    est=$(cat /sys/class/infiniband/${HCA}/ports/1/state 2>/dev/null | head -1 || echo desconocido)
+    case "$est" in
+      *ACTIVE*) echo "RDMA ${HCA} puerto 1: $est" ;;
+      *) echo "ABORTA: ${HCA} puerto 1 no esta ACTIVE (state='${est}'). Cable DAC?" >&2; exit 7 ;;
+    esac
+
+    # Pinning de CPU. La receta de origen usa `taskset -c 5-9,15-19`: 10 cores
+    # concretos. En decode el cuello es el lanzamiento de kernels desde CPU, no
+    # la GPU, asi que esto no es cosmetico.
+    CPUS="${VLLM_CPUSET:-5-9,15-19}"
+
+    ARGS=(
+      "$MODEL_PATH"
+      --revision "$MODEL_REVISION"
+      --served-model-name "$SERVED_MODEL_NAME"
+      --host 0.0.0.0 --port 8000
+      --tensor-parallel-size 2
+      # Multinodo. La receta de origen NO lleva estos flags porque Sparkrun los
+      # inyecta con su runtime `vllm-distributed`; al traducirla a k8s hay que
+      # ponerlos a mano. Sin ellos vLLM aborta con "World size (2) is larger
+      # than the number of available GPUs (1) in this node".
+      # Los cuatro solo aplican con distributed_executor_backend=mp, segun la
+      # docstring de vllm/config/parallel.py.
+      --distributed-executor-backend mp
+      # 01-09-2026: expert parallel. La receta de referencia de getrefined
+      # (Qwen3.8-Flash-Next-NVFP4-vLLM-DGX-Spark) atribuye a EP el grueso de su
+      # ventaja: "presumably EP plus vLLM's spec-decode-in-graphs being more
+      # mature". Nosotros corriamos TP=2 a secas.
+      #
+      # Medido antes de esto, con SU metodologia (streaming, temp 0, decode
+      # excluyendo TTFT, mediana de 2 reps):
+      #   code 45.1 | reasoning 48.8 | math 51.3 | csharp 38.3 | prosa 48.1
+      #   su mediana (code+reasoning+csharp) = 55.8; la nuestra 45.1  -> -19%
+      # OJO: en prosa ya ibamos MAS rapido (48.1 vs sus 36.4). Su titular de
+      # 55.8 es la mediana de code/reasoning/csharp, no incluye prosa, que es
+      # su peor caso.
+      --enable-expert-parallel
+      --all2all-backend allgather_reducescatter
+      --nnodes 2
+      --node-rank "$VLLM_NODE_RANK"
+      --master-addr "$VLLM_MASTER_ADDR"
+      --master-port 29501
+      --trust-remote-code
+      --gpu-memory-utilization "$GPU_MEM_UTIL"
+      --max-model-len "$MAX_MODEL_LEN"
+      --max-num-seqs "$MAX_NUM_SEQS"
+      --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS"
+      --kv-cache-dtype "$KV_CACHE_DTYPE"
+      # 01-09-2026: quitado --enable-prefix-caching, y resulto ser un NO-OP.
+      # vLLM V1 lo activa POR DEFECTO: con el flag fuera, el engine sigue
+      # reportando `enable_prefix_caching=True` y el arranque sigue diciendo
+      # "Mamba cache mode is set to 'align' ... when prefix caching is enabled"
+      # (config.py:605). Para apagarlo de verdad haria falta
+      # --no-enable-prefix-caching, que NO se pone: el prefix caching es justo
+      # lo que ayuda en carga agentica y multivuelta, que es el uso real aqui
+      # (las sesiones de OpenCode reusan prefijos largos).
+      #
+      # Asi que la mejora medida en este paso (mediana 47.0 -> 47.2, csharp
+      # 42.9 -> 44.8) viene de MAX_NUM_SEQS 10 -> 8, no de esto.
+      # 01-09-2026: SIN --language-model-only. Al retirar DeepSeek, este pasa a
+      # ser el backend de LITELLM_VISION_FALLBACK_MODEL, y con el flag puesto
+      # LiteLLM desviaba las imagenes a un servidor que arrancaba ciego
+      # ("All limits of multimodal modalities set to 0"). El model_info de
+      # `qwen38-flash-next` ya declaraba supports_vision: true, asi que la
+      # declaracion era falsa desde el 26-08.
+      #
+      # La torre visual NO cuesta NVFP4: quantization_config.ignore incluye
+      # `model.visual.*`, y sus 333 tensores no llevan weight_scale -- van en
+      # BF16. vLLM registra Qwen4ExpForConditionalGeneration en el registro
+      # MULTIMODAL (vllm.models.qwen3_8_flash_next), no en el de texto.
+      --compilation-config "$COMPILATION_CONFIG"
+      # 01-09-2026: FUERA --no-enable-flashinfer-autotune. La receta de
+      # referencia no lo lleva y con el arranque decia "Skipping FlashInfer
+      # autotune" (kernel_warmup.py:170): los kernels de FlashInfer corren sin
+      # tunear. El MoE va precisamente por FLASHINFER_CUTLASS (nvfp4.py:291),
+      # asi que esto no es cosmetico.
+      #
+      # Venia de la epoca de SGLang, donde el autotune fue sospechoso del bug
+      # del token 0. Ese diagnostico se FALSO midiendo (la causa real eran dos
+      # condiciones cruzadas), y ademas era otro motor. Aqui la referencia
+      # corre con autotune encendido y saca 55.8.
+      #
+      # REVERSION: volver a poner el flag. Base a batir sin el: mediana
+      # (code+reasoning+csharp) 46.1 en frio / 45.6 tras soak; prosa 50.4.
+      --speculative-config "$SPECULATIVE_CONFIG"
+      --enable-auto-tool-choice
+      --tool-call-parser "$TOOL_CALL_PARSER"
+      --reasoning-parser "$REASONING_PARSER"
+    )
+
+
+    # 01-09-2026: el rank != 0 va HEADLESS. Sin esto el follower arranca un
+    # servidor completo -- API server + EngineCore propio -- y ese EngineCore
+    # llama a collective_rpc("get_kv_cache_spec"), que solo vale en el lider:
+    #
+    #   AssertionError: collective_rpc should not be called on follower node
+    #   (vllm/v1/executor/multiproc_executor.py:385)
+    #
+    # El follower moria con eso y el head se quedaba colgado en un colectivo
+    # NCCL esperando a un rank1 de otra generacion: 34 min sin una sola linea
+    # de log y sin reiniciar, porque el startupProbe tolera 120x30s = 60 min.
+    # No es el RDMA: los dos puertos estaban ACTIVE a 200 Gb/s.
+    #
+    # La receta de origen no lo lleva porque Sparkrun lanza el follower por su
+    # cuenta con el runtime `vllm-distributed`; al traducirla a k8s los dos
+    # Deployments ejecutan el MISMO script y hay que distinguirlos aqui.
+    #
+    # `--headless` pone api_server_count=0 (serve.py:65-72); con eso
+    # `run_headless` ve node_rank_within_dp > 0 y monta el MultiprocExecutor
+    # follower: la rama que el propio codigo comenta como "Run headless
+    # workers (for multi-node PP/TP)" (serve.py:213).
+    if [ "${VLLM_NODE_RANK}" != "0" ]; then
+      ARGS+=( --headless )
+      HEADLESS_ON=si
+    else
+      HEADLESS_ON=no
+    fi
+
+    echo "QWEN_VLLM_EFFECTIVE rank=${VLLM_NODE_RANK} kv=${KV_CACHE_DTYPE} seqs=${MAX_NUM_SEQS} memutil=${GPU_MEM_UTIL} headless=${HEADLESS_ON}"
+    exec taskset -c "$CPUS" vllm serve "${ARGS[@]}"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qwen38-flash-next-head
+  namespace: llm
+  labels:
+    app: qwen38-flash-next-head
+    llm.dgx-infra/model-family: qwen38-next
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: qwen38-flash-next-head
+  template:
+    metadata:
+      annotations:
+        config.k8s.example.com/launch-revision: vllm-qwen38fn-20260901-bf16-seqs10
+      labels:
+        app: qwen38-flash-next-head
+        llm.dgx-infra/model-family: qwen38-next
+        endpoint-role: production
+        llm.dgx-infra/pool: tooling-resident
+    spec:
+      nodeSelector:
+        kubernetes.io/arch: arm64
+        kubernetes.io/hostname: gx10-ec3d
+      tolerations:
+        - { effect: NoSchedule, key: dedicated, operator: Equal, value: llm }
+      runtimeClassName: nvidia
+      restartPolicy: Always
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 120
+      # hostNetwork: los ranks se hablan por las IPs RoCE (10.0.0.x), que no
+      # existen dentro de la red de pods.
+      hostNetwork: true
+      dnsPolicy: Default
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:qwen38-flash-next
+          imagePullPolicy: IfNotPresent
+          command: ["bash", "/opt/qwen38fn/launch.sh"]
+          securityContext:
+            capabilities:
+              add: ["IPC_LOCK", "SYS_PTRACE"]
+          env:
+            # --- identidad del rank -------------------------------------------
+            - { name: VLLM_NODE_RANK, value: "0" }
+            - { name: VLLM_HOST_IP, value: "10.0.0.2" }
+            - { name: VLLM_MASTER_ADDR, value: "10.0.0.2" }
+            # --- receta (identica a la del despliegue hermano) -----------------
+            - { name: MODEL_PATH, value: "/cache/huggingface/hub/models--RadixArk--Qwen3.8-Flash-Next-NVFP4/snapshots/7b719225242aacd3dbd3f9407468c2ee9a9d2594" }
+            - { name: MODEL_REVISION, value: "7b719225242aacd3dbd3f9407468c2ee9a9d2594" }
+            - { name: SERVED_MODEL_NAME, value: "qwen38-flash-next" }
+            - { name: GPU_MEM_UTIL, value: "0.8" }
+            - { name: MAX_MODEL_LEN, value: "262144" }
+            # 8 para igualar la receta de referencia (era 10).
+            - { name: MAX_NUM_SEQS, value: "8" }
+            - { name: MAX_NUM_BATCHED_TOKENS, value: "8192" }
+            # 01-09-2026: KV en NVFP4. La nota anterior decia "BF16 obligatorio,
+            # la QSA rechaza fp8_e4m3 (vllm#54426)" -- eso sigue valiendo para
+            # fp8_e4m3, pero nvfp4 es otra ruta: no pasa por el parche de QSA,
+            # va por el backend FlashInfer, que es el UNICO que lo implementa.
+            # Comprobado en la imagen viva:
+            #   - CacheConfig.cache_dtype admite 'nvfp4' y 'nvfp4_4over6'.
+            #   - Solo flashinfer.py menciona nvfp4 entre los backends; el
+            #     propio codigo dice "fa2/fa3 do not support nvfp4" (l.1178).
+            # De ahi que haga falta forzar VLLM_ATTENTION_BACKEND: hoy las 12
+            # capas de full-attention salen en FlashAttention 2 por defecto
+            # (las 36 de linear-attn siguen en Triton/FLA GDN, no las toca esto).
+            #
+            # REVERSION: KV_CACHE_DTYPE=auto y fuera VLLM_ATTENTION_BACKEND
+            # devuelve la config medida a 50 tok/s con vision (SHA bcb11e0).
+            # FALSADO 01-09-2026, midiendo: nvfp4 NO arranca. La QSA de este
+            # modelo exige BF16 y no distingue el formato:
+            #
+            #   NotImplementedError: Qwen3.8-Flash-Next QSA requires a BF16
+            #   main KV cache
+            #   (vllm/models/qwen3_8_flash_next/nvidia/qsa.py)
+            #
+            # Mi hipotesis era que nvfp4 esquivaba la QSA por ir via FlashInfer
+            # en vez de por el parche de vllm#54426. Falsa: el bloqueo es a
+            # CUALQUIER KV que no sea BF16, no solo a fp8_e4m3. La nota
+            # original -- "BF16 obligatorio" -- era correcta y mas general.
+            #
+            # OJO al punto ciego: vLLM ACEPTA el flag y hasta anuncia "Using
+            # nvfp4 data type to store kv cache. It reduces the GPU memory
+            # footprint and boosts the performance" (cache.py:282). El rechazo
+            # llega despues, al construir el backend del modelo. Validar solo
+            # el parseo de argumentos no detecta esto.
+            - { name: KV_CACHE_DTYPE, value: "auto" }
+            # 01-09-2026: los tamanos de decode graph suben de [1,2,3,4] a
+            # cubrir hasta 40. Con MTP de 3 tokens cada paso de decode procesa
+            # (1 + num_speculative_tokens) = 4 tokens POR SECUENCIA, y con
+            # max_num_seqs=10 el batch de decode llega a 40. Capturando solo
+            # hasta 4, todo lo que pasara de una sola secuencia caia a modo
+            # eager y perdia el CUDA graph. Medido en el arranque:
+            # "Capturing decode CUDA graphs (FULL): 0/4".
+            #
+            # Es la explicacion candidata del hueco contra SGLang: aqui el
+            # accept length es 2.750 -- MEJOR que el 2.61 de la mejor config
+            # de SGLang -- y aun asi el throughput sale por debajo (41 vs
+            # 45.4 tok/s con texto real). Con mejor aceptacion y menos
+            # velocidad, el coste no esta en la especulacion sino por token.
+            # 01-09-2026: FUERA cudagraph_capture_sizes. La receta de
+            # referencia no los declara y deja elegir a vLLM. Los mios no
+            # servian de nada: los tamanos van en SECUENCIAS, no en tokens, y
+            # vLLM recorta en silencio todo lo que pase de max_num_seqs=10, asi
+            # que de [1,2,4,8,16,24,32,40] solo entraban [1,2,4,8] -- el log
+            # seguia diciendo "Capturing decode CUDA graphs (FULL): 0/4".
+            # Medido: 41.0 -> 42.4 tok/s, dentro del ruido.
+            - { name: COMPILATION_CONFIG, value: '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}' }
+            - { name: SPECULATIVE_CONFIG, value: '{"method":"mtp","num_speculative_tokens":3}' }
+            - { name: TOOL_CALL_PARSER, value: "qwen3_coder" }
+            - { name: REASONING_PARSER, value: "qwen3" }
+            - { name: VLLM_CPUSET, value: "5-9,15-19" }
+            # --- arquitectura: la imagen trae 12.0, el GB10 es 12.1 ------------
+            - { name: TORCH_CUDA_ARCH_LIST, value: "12.1f" }
+            - { name: CUTE_DSL_ARCH, value: "sm_121a" }
+            - { name: FLASHINFER_CUDA_ARCH_LIST, value: "12.1a" }
+            - { name: FLASHINFER_DISABLE_VERSION_CHECK, value: "1" }
+            # --- PLE ----------------------------------------------------------
+            # 01-09-2026 EN PRUEBAS: offload del PLE a CPU. Es la ultima palanca
+            # sin probar de la receta de referencia, que lo deja opcional
+            # (PLE_OFFLOAD=1). Mecanismo: con esto la GPU retiene SOLO la escala
+            # FP8 global y un proceso CPU es dueno del embedding y devuelve el
+            # lookup ya cuantizado (ver load_weights en el ConfigMap del parche).
+            # Saca de la GPU un gather sobre una tabla de 51B, que es lo mas
+            # hostil al ancho de banda que hay en el forward.
+            #
+            # QUE MEDIR: pasos/s, no tok/s. El hueco contra la referencia es
+            # coste FIJO por paso -- 16.25 pasos/s nuestros contra sus 22.3 --
+            # y es constante entre tipos de contenido (code 16.1, reasoning
+            # 16.2, math 16.4, csharp 16.4). tok/s solo refleja la aceptacion
+            # del MTP, que ya va MEJOR que la suya.
+            #
+            # RIESGO: un round-trip IPC al proceso CPU por paso puede anadir mas
+            # latencia de la que ahorra. Si pasos/s no sube por encima de ~17,
+            # se revierte: con sigma ~1.2-1.6 nada por debajo de +5% es creible.
+            # FALSADO 01-09-2026: NO se puede usar aqui. vLLM lo rechaza al
+            # arrancar, no es que rinda peor:
+            #   ValueError: VLLM_PLE_CPU_OFFLOAD does not support the requested
+            #   configuration. Unsupported settings: nnodes=2
+            #   (gpu_worker.py:247, _validate_ple_offload_config)
+            # Es incompatible con multinodo, punto. Lo que implica que la receta
+            # de referencia TAMPOCO lo uso en sus dos Sparks: por eso lo dejan
+            # opcional y no sale en sus numeros.
+            - { name: VLLM_PLE_CPU_OFFLOAD, value: "0" }
+            - { name: VLLM_PLE_FP8_CHECKPOINT, value: "1" }
+            # 01-09-2026 PREVENTIVO, no arregla nada hoy. En sm_121 (GB10) el
+            # gate de DeepGEMM se abre y no deberia: support_deep_gemm() acepta
+            # la FAMILIA 120 entera, y GB10 cae dentro sin ser un device donde
+            # DeepGEMM tenga kernels. Con una capa blockwise-FP8 delante,
+            # selecciona DeepGemmFp8BlockScaledMMKernel y revienta con un CUDA
+            # fault durante el profile_run del arranque -- vllm#54125.
+            #
+            # A NOSOTROS HOY NO NOS TOCA, comprobado en el pod vivo:
+            #   quant_algo NVFP4, esquemas de peso {(4 bits, None, None)}
+            #   sin FP8_PB_WO ni block_structure en el checkpoint
+            #   cero lineas "Selected ...BlockScaledMMKernel" en el arranque
+            #   cero kernels DeepGEMM en la traza del profiler (de 173 distintos)
+            # Los modulos que el checkpoint excluye de cuantizar (self_attn,
+            # linear_attn, mlp.gate, shared_expert, mtp) van en BF16, no en FP8,
+            # asi que no hay ninguna capa que pueda pedir la ruta rota.
+            #
+            # Se pone igualmente porque cuesta cero y el sintoma es traicionero:
+            # "Engine core initialization failed. Failed core proc(s): {}" con el
+            # frame de DeepGEMM enterrado -- el MISMO error generico que costo 34
+            # min de diagnostico con el --headless. Si algun dia se prueba aqui un
+            # checkpoint mixto NVFP4+FP8, el seguro ya esta puesto.
+            - { name: VLLM_USE_DEEP_GEMM, value: "0" }
+            # --- red: RoCE por el puerto f0, que es el cableado aqui ----------
+            - { name: RDMA_IFACE, value: "enp1s0f0np0" }
+            - { name: RDMA_HCA, value: "rocep1s0f0" }
+            - { name: NCCL_SOCKET_IFNAME, value: "enp1s0f0np0" }
+            - { name: GLOO_SOCKET_IFNAME, value: "enp1s0f0np0" }
+            # 01-09-2026: el "=" delante es EXACT-MATCH. Sin el, NCCL hace
+            # match por PREFIJO y "rocep1s0f0" tambien casa "rocep1s0f1", que
+            # esta DOWN. Con expert parallel esto pasa de cosmetico a serio: el
+            # all2all de EP reparte trafico por cualquier puerto de la lista.
+            # Aviso literal del README de la receta: "pin NCCL to a single
+            # exact-match HCA ... watched a healthy DeepSeek pair drop to under
+            # 1 tok/s before working out what was happening".
+            - { name: NCCL_IB_HCA, value: "=rocep1s0f0" }
+            - { name: NCCL_IB_DISABLE, value: "0" }
+            - { name: NCCL_IB_GID_INDEX, value: "3" }
+            - { name: NCCL_CROSS_NIC, value: "1" }
+            - { name: NCCL_NET, value: "IB" }
+            - { name: NCCL_IB_ADDR_FAMILY, value: "AF_INET" }
+            - { name: NCCL_IB_ROCE_VERSION_NUM, value: "2" }
+            # CUMEM se queda en 0. FALSADO midiendo el 01-09-2026: lo puse a 1
+            # razonando que sin CUDA VMM el registro de buffers cae a rutas de
+            # copia y con IB ahi se pierde ancho de banda. Sale PEOR, en las
+            # cinco categorias:
+            #   mediana 47.2 -> 45.9 | code 47.2->45.9 | reasoning 50.3->46.6
+            #   math 56.6->54.4 | csharp 44.8->42.0 | prosa 44.8->42.1
+            # El 0 venia sin comentario y parecia arrastre de DeepSeek; resulta
+            # ser el valor bueno en esta maquina. Ahora ya esta documentado.
+            #
+            # Lo que el desglose SI dice, y sigue sin explicarse: nuestro accept
+            # es 2.769 con 47.2 tok/s -> 17.0 pasos forward/s; la referencia,
+            # con accept ~2.5 y 55.8 -> 22.3 pasos/s. Difiere el RITMO DEL PASO,
+            # no la especulacion. Pero no es CUMEM.
+            - { name: NCCL_CUMEM_ENABLE, value: "0" }
+            - { name: NCCL_IGNORE_CPU_AFFINITY, value: "1" }
+            # Las dos que la receta de referencia tiene y aqui faltaban.
+            - { name: TP_SOCKET_IFNAME, value: "enp1s0f0np0" }
+            - { name: NCCL_IB_AUTO_DETECT, value: "0" }
+            - { name: NCCL_NVLS_ENABLE, value: "0" }
+            - { name: NCCL_DEBUG, value: "WARN" }
+            # --- HF offline ---------------------------------------------------
+            - { name: HF_HOME, value: "/cache/huggingface" }
+            - { name: HF_HUB_OFFLINE, value: "1" }
+            - { name: TRANSFORMERS_OFFLINE, value: "1" }
+            - { name: VLLM_HTTP_TIMEOUT_KEEP_ALIVE, value: "600" }
+            - { name: VLLM_USAGE_SOURCE, value: "production-docker-image" }
+          ports:
+            - { containerPort: 8000, name: http, protocol: TCP }
+          startupProbe:
+            httpGet: { path: /health, port: 8000, scheme: HTTP }
+            failureThreshold: 120
+            periodSeconds: 30
+            timeoutSeconds: 10
+          readinessProbe:
+            httpGet: { path: /health, port: 8000, scheme: HTTP }
+            failureThreshold: 3
+            periodSeconds: 15
+            timeoutSeconds: 10
+          resources:
+            requests: { cpu: "4", memory: 88Gi }
+            limits:
+              memory: 112Gi
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - { name: hf-cache, mountPath: /cache/huggingface, readOnly: true }
+            - { name: launch, mountPath: /opt/qwen38fn, readOnly: true }
+            # El parche PLE se monta ENCIMA del fichero de la imagen. subPath es
+            # el equivalente k8s al bind-mount de un solo fichero que usa la
+            # receta original.
+            - name: ple-patch
+              mountPath: /usr/local/lib/python3.12/dist-packages/vllm/models/qwen3_8_flash_next/nvidia/ple_layer.py
+              subPath: ple_layer.py
+              readOnly: true
+            - { name: vllm-tmp, mountPath: /tmp }
+            - { name: infiniband, mountPath: /dev/infiniband }
+            - { name: shm, mountPath: /dev/shm }
+      volumes:
+        # Los pesos se leen por NFS-RDMA desde nvidia-dgx, igual que en SGLang.
+        - name: hf-cache
+          persistentVolumeClaim: { claimName: hf-cache-nvidia-dgx-ro, readOnly: true }
+        - name: launch
+          configMap: { name: qwen38-flash-next-vllm-launch, defaultMode: 365 }
+        - name: ple-patch
+          configMap: { name: qwen38-flash-next-vllm-ple }
+        - name: vllm-tmp
+          hostPath: { path: /home/HEAD_USER/.cache/vllm-tmp, type: DirectoryOrCreate }
+        - name: infiniband
+          hostPath: { path: /dev/infiniband, type: Directory }
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 16Gi }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qwen38-flash-next-worker
+  namespace: llm
+  labels:
+    app: qwen38-flash-next-worker
+    llm.dgx-infra/model-family: qwen38-next
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: qwen38-flash-next-worker
+  template:
+    metadata:
+      annotations:
+        config.k8s.example.com/launch-revision: vllm-qwen38fn-20260901-bf16-seqs10
+      labels:
+        app: qwen38-flash-next-worker
+        llm.dgx-infra/model-family: qwen38-next
+    spec:
+      nodeSelector:
+        kubernetes.io/arch: arm64
+        kubernetes.io/hostname: nvidia-dgx
+      tolerations:
+        - { effect: NoSchedule, key: dedicated, operator: Equal, value: llm }
+      runtimeClassName: nvidia
+      restartPolicy: Always
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 120
+      # hostNetwork: los ranks se hablan por las IPs RoCE (10.0.0.x), que no
+      # existen dentro de la red de pods.
+      hostNetwork: true
+      dnsPolicy: Default
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:qwen38-flash-next
+          imagePullPolicy: IfNotPresent
+          command: ["bash", "/opt/qwen38fn/launch.sh"]
+          securityContext:
+            capabilities:
+              add: ["IPC_LOCK", "SYS_PTRACE"]
+          env:
+            # --- identidad del rank -------------------------------------------
+            - { name: VLLM_NODE_RANK, value: "1" }
+            - { name: VLLM_HOST_IP, value: "10.0.0.1" }
+            - { name: VLLM_MASTER_ADDR, value: "10.0.0.2" }
+            # --- receta (identica a la del despliegue hermano) -----------------
+            - { name: MODEL_PATH, value: "/cache/huggingface/hub/models--RadixArk--Qwen3.8-Flash-Next-NVFP4/snapshots/7b719225242aacd3dbd3f9407468c2ee9a9d2594" }
+            - { name: MODEL_REVISION, value: "7b719225242aacd3dbd3f9407468c2ee9a9d2594" }
+            - { name: SERVED_MODEL_NAME, value: "qwen38-flash-next" }
+            - { name: GPU_MEM_UTIL, value: "0.8" }
+            - { name: MAX_MODEL_LEN, value: "262144" }
+            # 8 para igualar la receta de referencia (era 10).
+            - { name: MAX_NUM_SEQS, value: "8" }
+            - { name: MAX_NUM_BATCHED_TOKENS, value: "8192" }
+            # 01-09-2026: KV en NVFP4. La nota anterior decia "BF16 obligatorio,
+            # la QSA rechaza fp8_e4m3 (vllm#54426)" -- eso sigue valiendo para
+            # fp8_e4m3, pero nvfp4 es otra ruta: no pasa por el parche de QSA,
+            # va por el backend FlashInfer, que es el UNICO que lo implementa.
+            # Comprobado en la imagen viva:
+            #   - CacheConfig.cache_dtype admite 'nvfp4' y 'nvfp4_4over6'.
+            #   - Solo flashinfer.py menciona nvfp4 entre los backends; el
+            #     propio codigo dice "fa2/fa3 do not support nvfp4" (l.1178).
+            # De ahi que haga falta forzar VLLM_ATTENTION_BACKEND: hoy las 12
+            # capas de full-attention salen en FlashAttention 2 por defecto
+            # (las 36 de linear-attn siguen en Triton/FLA GDN, no las toca esto).
+            #
+            # REVERSION: KV_CACHE_DTYPE=auto y fuera VLLM_ATTENTION_BACKEND
+            # devuelve la config medida a 50 tok/s con vision (SHA bcb11e0).
+            # FALSADO 01-09-2026, midiendo: nvfp4 NO arranca. La QSA de este
+            # modelo exige BF16 y no distingue el formato:
+            #
+            #   NotImplementedError: Qwen3.8-Flash-Next QSA requires a BF16
+            #   main KV cache
+            #   (vllm/models/qwen3_8_flash_next/nvidia/qsa.py)
+            #
+            # Mi hipotesis era que nvfp4 esquivaba la QSA por ir via FlashInfer
+            # en vez de por el parche de vllm#54426. Falsa: el bloqueo es a
+            # CUALQUIER KV que no sea BF16, no solo a fp8_e4m3. La nota
+            # original -- "BF16 obligatorio" -- era correcta y mas general.
+            #
+            # OJO al punto ciego: vLLM ACEPTA el flag y hasta anuncia "Using
+            # nvfp4 data type to store kv cache. It reduces the GPU memory
+            # footprint and boosts the performance" (cache.py:282). El rechazo
+            # llega despues, al construir el backend del modelo. Validar solo
+            # el parseo de argumentos no detecta esto.
+            - { name: KV_CACHE_DTYPE, value: "auto" }
+            # 01-09-2026: los tamanos de decode graph suben de [1,2,3,4] a
+            # cubrir hasta 40. Con MTP de 3 tokens cada paso de decode procesa
+            # (1 + num_speculative_tokens) = 4 tokens POR SECUENCIA, y con
+            # max_num_seqs=10 el batch de decode llega a 40. Capturando solo
+            # hasta 4, todo lo que pasara de una sola secuencia caia a modo
+            # eager y perdia el CUDA graph. Medido en el arranque:
+            # "Capturing decode CUDA graphs (FULL): 0/4".
+            #
+            # Es la explicacion candidata del hueco contra SGLang: aqui el
+            # accept length es 2.750 -- MEJOR que el 2.61 de la mejor config
+            # de SGLang -- y aun asi el throughput sale por debajo (41 vs
+            # 45.4 tok/s con texto real). Con mejor aceptacion y menos
+            # velocidad, el coste no esta en la especulacion sino por token.
+            # 01-09-2026: FUERA cudagraph_capture_sizes. La receta de
+            # referencia no los declara y deja elegir a vLLM. Los mios no
+            # servian de nada: los tamanos van en SECUENCIAS, no en tokens, y
+            # vLLM recorta en silencio todo lo que pase de max_num_seqs=10, asi
+            # que de [1,2,4,8,16,24,32,40] solo entraban [1,2,4,8] -- el log
+            # seguia diciendo "Capturing decode CUDA graphs (FULL): 0/4".
+            # Medido: 41.0 -> 42.4 tok/s, dentro del ruido.
+            - { name: COMPILATION_CONFIG, value: '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}' }
+            - { name: SPECULATIVE_CONFIG, value: '{"method":"mtp","num_speculative_tokens":3}' }
+            - { name: TOOL_CALL_PARSER, value: "qwen3_coder" }
+            - { name: REASONING_PARSER, value: "qwen3" }
+            - { name: VLLM_CPUSET, value: "5-9,15-19" }
+            # --- arquitectura: la imagen trae 12.0, el GB10 es 12.1 ------------
+            - { name: TORCH_CUDA_ARCH_LIST, value: "12.1f" }
+            - { name: CUTE_DSL_ARCH, value: "sm_121a" }
+            - { name: FLASHINFER_CUDA_ARCH_LIST, value: "12.1a" }
+            - { name: FLASHINFER_DISABLE_VERSION_CHECK, value: "1" }
+            # --- PLE ----------------------------------------------------------
+            # 01-09-2026 EN PRUEBAS: offload del PLE a CPU. Es la ultima palanca
+            # sin probar de la receta de referencia, que lo deja opcional
+            # (PLE_OFFLOAD=1). Mecanismo: con esto la GPU retiene SOLO la escala
+            # FP8 global y un proceso CPU es dueno del embedding y devuelve el
+            # lookup ya cuantizado (ver load_weights en el ConfigMap del parche).
+            # Saca de la GPU un gather sobre una tabla de 51B, que es lo mas
+            # hostil al ancho de banda que hay en el forward.
+            #
+            # QUE MEDIR: pasos/s, no tok/s. El hueco contra la referencia es
+            # coste FIJO por paso -- 16.25 pasos/s nuestros contra sus 22.3 --
+            # y es constante entre tipos de contenido (code 16.1, reasoning
+            # 16.2, math 16.4, csharp 16.4). tok/s solo refleja la aceptacion
+            # del MTP, que ya va MEJOR que la suya.
+            #
+            # RIESGO: un round-trip IPC al proceso CPU por paso puede anadir mas
+            # latencia de la que ahorra. Si pasos/s no sube por encima de ~17,
+            # se revierte: con sigma ~1.2-1.6 nada por debajo de +5% es creible.
+            # FALSADO 01-09-2026: NO se puede usar aqui. vLLM lo rechaza al
+            # arrancar, no es que rinda peor:
+            #   ValueError: VLLM_PLE_CPU_OFFLOAD does not support the requested
+            #   configuration. Unsupported settings: nnodes=2
+            #   (gpu_worker.py:247, _validate_ple_offload_config)
+            # Es incompatible con multinodo, punto. Lo que implica que la receta
+            # de referencia TAMPOCO lo uso en sus dos Sparks: por eso lo dejan
+            # opcional y no sale en sus numeros.
+            - { name: VLLM_PLE_CPU_OFFLOAD, value: "0" }
+            - { name: VLLM_PLE_FP8_CHECKPOINT, value: "1" }
+            # 01-09-2026 PREVENTIVO, no arregla nada hoy. En sm_121 (GB10) el
+            # gate de DeepGEMM se abre y no deberia: support_deep_gemm() acepta
+            # la FAMILIA 120 entera, y GB10 cae dentro sin ser un device donde
+            # DeepGEMM tenga kernels. Con una capa blockwise-FP8 delante,
+            # selecciona DeepGemmFp8BlockScaledMMKernel y revienta con un CUDA
+            # fault durante el profile_run del arranque -- vllm#54125.
+            #
+            # A NOSOTROS HOY NO NOS TOCA, comprobado en el pod vivo:
+            #   quant_algo NVFP4, esquemas de peso {(4 bits, None, None)}
+            #   sin FP8_PB_WO ni block_structure en el checkpoint
+            #   cero lineas "Selected ...BlockScaledMMKernel" en el arranque
+            #   cero kernels DeepGEMM en la traza del profiler (de 173 distintos)
+            # Los modulos que el checkpoint excluye de cuantizar (self_attn,
+            # linear_attn, mlp.gate, shared_expert, mtp) van en BF16, no en FP8,
+            # asi que no hay ninguna capa que pueda pedir la ruta rota.
+            #
+            # Se pone igualmente porque cuesta cero y el sintoma es traicionero:
+            # "Engine core initialization failed. Failed core proc(s): {}" con el
+            # frame de DeepGEMM enterrado -- el MISMO error generico que costo 34
+            # min de diagnostico con el --headless. Si algun dia se prueba aqui un
+            # checkpoint mixto NVFP4+FP8, el seguro ya esta puesto.
+            - { name: VLLM_USE_DEEP_GEMM, value: "0" }
+            # --- red: RoCE por el puerto f0, que es el cableado aqui ----------
+            - { name: RDMA_IFACE, value: "enp1s0f0np0" }
+            - { name: RDMA_HCA, value: "rocep1s0f0" }
+            - { name: NCCL_SOCKET_IFNAME, value: "enp1s0f0np0" }
+            - { name: GLOO_SOCKET_IFNAME, value: "enp1s0f0np0" }
+            # 01-09-2026: el "=" delante es EXACT-MATCH. Sin el, NCCL hace
+            # match por PREFIJO y "rocep1s0f0" tambien casa "rocep1s0f1", que
+            # esta DOWN. Con expert parallel esto pasa de cosmetico a serio: el
+            # all2all de EP reparte trafico por cualquier puerto de la lista.
+            # Aviso literal del README de la receta: "pin NCCL to a single
+            # exact-match HCA ... watched a healthy DeepSeek pair drop to under
+            # 1 tok/s before working out what was happening".
+            - { name: NCCL_IB_HCA, value: "=rocep1s0f0" }
+            - { name: NCCL_IB_DISABLE, value: "0" }
+            - { name: NCCL_IB_GID_INDEX, value: "3" }
+            - { name: NCCL_CROSS_NIC, value: "1" }
+            - { name: NCCL_NET, value: "IB" }
+            - { name: NCCL_IB_ADDR_FAMILY, value: "AF_INET" }
+            - { name: NCCL_IB_ROCE_VERSION_NUM, value: "2" }
+            # CUMEM se queda en 0. FALSADO midiendo el 01-09-2026: lo puse a 1
+            # razonando que sin CUDA VMM el registro de buffers cae a rutas de
+            # copia y con IB ahi se pierde ancho de banda. Sale PEOR, en las
+            # cinco categorias:
+            #   mediana 47.2 -> 45.9 | code 47.2->45.9 | reasoning 50.3->46.6
+            #   math 56.6->54.4 | csharp 44.8->42.0 | prosa 44.8->42.1
+            # El 0 venia sin comentario y parecia arrastre de DeepSeek; resulta
+            # ser el valor bueno en esta maquina. Ahora ya esta documentado.
+            #
+            # Lo que el desglose SI dice, y sigue sin explicarse: nuestro accept
+            # es 2.769 con 47.2 tok/s -> 17.0 pasos forward/s; la referencia,
+            # con accept ~2.5 y 55.8 -> 22.3 pasos/s. Difiere el RITMO DEL PASO,
+            # no la especulacion. Pero no es CUMEM.
+            - { name: NCCL_CUMEM_ENABLE, value: "0" }
+            - { name: NCCL_IGNORE_CPU_AFFINITY, value: "1" }
+            # Las dos que la receta de referencia tiene y aqui faltaban.
+            - { name: TP_SOCKET_IFNAME, value: "enp1s0f0np0" }
+            - { name: NCCL_IB_AUTO_DETECT, value: "0" }
+            - { name: NCCL_NVLS_ENABLE, value: "0" }
+            - { name: NCCL_DEBUG, value: "WARN" }
+            # --- HF offline ---------------------------------------------------
+            - { name: HF_HOME, value: "/cache/huggingface" }
+            - { name: HF_HUB_OFFLINE, value: "1" }
+            - { name: TRANSFORMERS_OFFLINE, value: "1" }
+            - { name: VLLM_HTTP_TIMEOUT_KEEP_ALIVE, value: "600" }
+            - { name: VLLM_USAGE_SOURCE, value: "production-docker-image" }
+          # El worker NO expone API: participa en el TP y no sirve HTTP.
+          # Su readiness la da el proceso vivo, no un /health que no existe.
+          resources:
+            requests: { cpu: "4", memory: 88Gi }
+            limits:
+              memory: 112Gi
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - { name: hf-cache, mountPath: /cache/huggingface, readOnly: true }
+            - { name: launch, mountPath: /opt/qwen38fn, readOnly: true }
+            # El parche PLE se monta ENCIMA del fichero de la imagen. subPath es
+            # el equivalente k8s al bind-mount de un solo fichero que usa la
+            # receta original.
+            - name: ple-patch
+              mountPath: /usr/local/lib/python3.12/dist-packages/vllm/models/qwen3_8_flash_next/nvidia/ple_layer.py
+              subPath: ple_layer.py
+              readOnly: true
+            - { name: vllm-tmp, mountPath: /tmp }
+            - { name: infiniband, mountPath: /dev/infiniband }
+            - { name: shm, mountPath: /dev/shm }
+      volumes:
+        # El worker corre EN nvidia-dgx, que es el propio servidor NFS: montar
+        # ahi el PVC hf-cache-nvidia-dgx-ro es pedirle al servidor que se monte a
+        # si mismo, y responde "access denied by server". Los pesos ya estan en
+        # disco local, asi que va por hostPath. El head, que corre en gx10-ec3d,
+        # si usa el PVC. Mismo reparto que tenia el manifiesto de SGLang.
+        - name: hf-cache
+          hostPath: { path: /home/WORKER_USER/.cache/huggingface, type: Directory }
+        - name: launch
+          configMap: { name: qwen38-flash-next-vllm-launch, defaultMode: 365 }
+        - name: ple-patch
+          configMap: { name: qwen38-flash-next-vllm-ple }
+        - name: vllm-tmp
+          hostPath: { path: /home/HEAD_USER/.cache/vllm-tmp, type: DirectoryOrCreate }
+        - name: infiniband
+          hostPath: { path: /dev/infiniband, type: Directory }
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 16Gi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: qwen38-flash-next
+  namespace: llm
+  labels:
+    llm.dgx-infra/model-family: qwen38-next
+spec:
+  type: ClusterIP
+  # hostNetwork: el selector apunta al pod, pero el trafico entra por la IP del
+  # nodo. Se conserva la forma del Service de SGLang para no tocar LiteLLM.
+  selector:
+    app: qwen38-flash-next-head
+  ports:
+    - { name: http, port: 8000, targetPort: 8000, protocol: TCP }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: qwen38-flash-next-head
+  namespace: llm
+  labels:
+    llm.dgx-infra/model-family: qwen38-next
+spec:
+  type: ClusterIP
+  selector:
+    app: qwen38-flash-next-head
+  ports:
+    - { name: http, port: 8000, targetPort: 8000, protocol: TCP }
